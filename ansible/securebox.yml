@@ -1,0 +1,264 @@
+---
+- name: SecureBox server provisioning
+  hosts: securebox
+  become: true
+
+  tasks:
+
+    #-- Prerequisitws -------------------
+    - name: Install acl package
+      ansible.builtin.apt:
+        name: acl
+        state: present
+
+    - name: Install auditd package
+      ansible.builtin.apt:
+        name: auditd
+        state: present
+        
+
+    # ── Groups ──────────────────────────
+    - name: Create Developers group
+      ansible.builtin.group:
+        name: developers
+        state: present
+
+    - name: Create Webteam group
+      ansible.builtin.group:
+        name: webteam
+        state: present
+
+    - name: Create Auditors group
+      ansible.builtin.group:
+        name: auditors
+        state: present
+
+
+    #-- Users(Sysytem) --------------------
+    - name: Create nginx service account
+      ansible.builtin.user:
+        name: nginx
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        groups: webteam
+        append: true
+        state: present
+
+    - name: Create backendapp service account
+      ansible.builtin.user:
+        name: backendapp
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        state: present
+
+    - name: Create db service account
+      ansible.builtin.user:
+        name: db
+        system: true
+        shell: /usr/sbib/nologin
+        create_home: false
+        state: present
+
+
+    #--Users(Human) ------------------
+    - name: Create alex admin account
+      ansible.builtin.user:
+        name: alex
+        shell: /bin/bash
+        create_home: true
+        groups: developers
+        append: true
+        state: present
+
+    - name: Create bob developer account
+      ansible.builtin.user:
+        name: bob
+        shell: /bin/bash
+        create_home: true
+        groups: 
+          - developers
+          - webteam
+        append: true
+        state: present
+
+    - name: Create vekez auditor account
+      ansible.builtin.user:
+        name: vekez
+        shell: /bin/bash
+        create_home: true
+        groups: auditors
+        append: true
+        state: present
+
+    #-- Directories --------------------
+    - name: Create application directory
+      ansible.builtin.file:
+        path: /opt/myapp
+        state: directory
+        owner: backendapp
+        group: developers
+        mode: '2750'
+
+    - name: Create log directory
+      ansible.builtin.file:
+        path: /var/log/myapp
+        state: directory
+        owner: backendapp
+        group: auditors
+        mode: '0750'
+
+    - name: Create web directory
+      ansible.builtin.file:
+        path: /srv/web
+        state: directory
+        owner: nginx
+        group: webteam
+        mode: '0750'
+
+    #-- Sudo policy --------------------
+    - name: Deploy sudo policy
+      ansible.builtin.template:
+        src: templates/securebox_sudo.j2
+        dest: /etc/sudoers.d/securebox
+        owner: root
+        group: root
+        mode: '0440'
+        validate: /usr/sbin/visudo -cf %s
+
+    #-- ACLs ----------------------------
+    - name: Give bob depoyment access to app directory
+      ansible.builtin.acl:
+        path: /opt/myapp
+        entity: bob
+        etype: user
+        permissions: rwx
+        recalculate_mask: no_mask
+        state: present
+
+    - name: Give vekez read access to log directory
+      ansible.builtin.acl:
+        path: /var/log/myapp
+        entity: vekez
+        etype: user
+        permissions: rx
+        state: present
+
+    - name: Set default ACL for vekez on log directory
+      ansible.builtin.acl:
+        path: /var/log/myapp
+        entity: vekez
+        etype: user
+        permissions: rx
+        default: true
+        state: present
+
+    #-- PAM - Password aging ---------------
+    - name: Set passwordaging for alex
+      ansible.builtin.command:
+        cmd: chage -M 90 -W 14 alex
+      changed_when: false
+
+    - name: Set passwordaging for bob
+      ansible.builtin.command:
+        cmd: chage -M 90 -W 14 bob
+      changed_when: false
+
+    - name: Set passwordaging for vekez
+      ansible.builtin.command:
+        cmd: chage -M 90 -W 14 vekez
+      changed_when: false
+
+    #-- SSH Hardening ----------------------
+    - name: Disable root SSH login
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+        state: present
+      notify: Restart SSH
+
+    - name: Disable password authentication
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        state: present
+      notify: Restart SSH
+
+    - name: Restrict SSH to authorized users
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?AllowUsers'
+        line: 'AllowUsers vboxuser alex bob'
+        state: present
+      notify: Restart SSH
+
+    #---- Auditd ----------------------
+    - name: Deploy Audit rules
+      ansible.builtin.copy:
+        dest: /etc/audit/rules.d/audit.rules
+        content: |
+          ##Sudoers modifications
+          -w /etc/sudoers -p wa -k sudo_modification
+          -w /etc/sudoers.d/ -p wa -k sudo_modification
+
+          ##User Database modification
+          -w /etc/passwd -p wa -k user_modification
+          -w /etc/shadow -p wa -k user-modification
+          -w /etc/group  -p wa -k user_modification
+
+          ## Sudo execution
+          -w /usr/bin/sudo -p x -k sudo_command_use
+
+        owner: root
+        group: root
+        mode: '0640'
+
+    - name: Enable and start auditd
+      ansible.builtin.service:
+        name: auditd
+        state: started
+        enabled: true
+
+    - name: Reload audit rules
+      ansible.builtin.command:
+        cmd: augenrules --load
+      changed_when: false
+      failed_when: false
+
+    #----- Systemtd service unit -----------
+    - name: Deploy Backendapp service unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/Backendapp.service
+        content: |
+          [Unit]
+          Description=Backend Application
+
+          [Service]
+          ExecStart=/bin/sleep infinity
+
+          [Install]
+          WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start Backendapp service
+      ansible.builtin.systemd:
+        name: Backendapp
+        state: started
+        enabled: true
+
+  handlers:
+    - name: Restart SSH
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+

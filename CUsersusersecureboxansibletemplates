@@ -1,0 +1,9 @@
+#SecureBox sudo policy
+#Alex - full admin access
+alex ALL=(ALL) ALL
+
+#Bob - restart backend service only
+bob ALL=(root) NOPASSWD: /usr/bin/systemctl restart backendapp
+
+# Vekez - read logs only
+vekez ALL=(root) PASSWD: /usr/bin/journalctl
